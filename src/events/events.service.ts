@@ -78,6 +78,28 @@ export class EventsService {
     });
   }
 
+  /**
+   * Return only the events that a specific user is invited to.
+   * Used by GET /events?userId=:id.
+   */
+  async findAllForUser(userId: string): Promise<Event[]> {
+    const user = await this.usersRepository.findOne({
+      where: { id: userId },
+    });
+    if (!user) {
+      throw new NotFoundException(`User with id "${userId}" not found`);
+    }
+    const eventIds = (user.events ?? []).filter(Boolean);
+    if (eventIds.length === 0) {
+      return [];
+    }
+    return this.eventsRepository.find({
+      where: { id: In(eventIds) },
+      relations: { invitees: true },
+      order: { startTime: 'ASC' },
+    });
+  }
+
   async deleteById(id: string): Promise<void> {
     const event = await this.eventsRepository.findOne({
       where: { id },
@@ -120,7 +142,6 @@ export class EventsService {
       throw new NotFoundException(`User with id "${userId}" not found`);
     }
 
-    // Load the user's current events fully (with invitees for the merge).
     const eventIds = (user.events ?? []).filter(Boolean);
     if (eventIds.length === 0) {
       return [];
@@ -179,12 +200,10 @@ export class EventsService {
 
     for (const cluster of clusters) {
       if (cluster.members.length === 1) {
-        // Nothing to merge — keep the original event as-is.
         merged.push(cluster.members[0]);
         continue;
       }
 
-      // Union of invitees across all members in the cluster.
       const inviteeMap = new Map<string, User>();
       for (const m of cluster.members) {
         for (const u of m.invitees ?? []) {
@@ -193,9 +212,6 @@ export class EventsService {
       }
       const mergedInvitees = Array.from(inviteeMap.values());
 
-      // Replacement event: append titles/descriptions, choose a "reasonable" status.
-      // Heuristic: prefer IN_PROGRESS if any member is IN_PROGRESS, else COMPLETED
-      // if any is COMPLETED, else TODO. This matches the FAQ's "reasonable value".
       const newStatus = pickStatus(cluster.statuses);
 
       const newEvent = this.eventsRepository.create({
@@ -211,13 +227,8 @@ export class EventsService {
       });
 
       const saved = await this.eventsRepository.save(newEvent);
-
-      // Delete the originals and update every invitee's `events` list to
-      // reference the new merged id.
       const oldIds = new Set(cluster.members.map((m) => m.id));
 
-      // Clear the join-table rows for each original event before deleting,
-      // otherwise the FOREIGN KEY on `event_invitees.event_id` blocks the DELETE.
       for (const m of cluster.members) {
         m.invitees = [];
         await this.eventsRepository.save(m);
@@ -231,14 +242,14 @@ export class EventsService {
         await this.usersRepository.save(u);
       }
 
-      // Reload with relations for the response.
       merged.push(await this.findById(saved.id));
     }
 
     return merged;
   }
 
-  // ---------- helpers ----------
+  // ── helpers ──────────────────────────────────────────────────────────────
+
   private assertTimeRange(start: Date, end: Date): void {
     if (end.getTime() <= start.getTime()) {
       throw new BadRequestException('endTime must be after startTime');

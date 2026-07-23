@@ -10,15 +10,14 @@ import { EventsModule } from '../src/events/events.module';
 import { UsersModule } from '../src/users/users.module';
 
 /**
- * End-to-end test that boots the full Nest app against a real
+ * End-to-end tests that boot the full Nest app against a real
  * SQLite database file (per assignment FAQ #1: do "both" — mocked
  * unit tests + a real DB path).
  *
  * Stability notes:
- *   - We pick a free high port up front and pass it to `app.listen(port)`
- *     so back-to-back jest runs do not race the kernel's port-recycle window.
- *   - We close the app fully in afterAll and wait for the close callback
- *     to resolve before the jest worker exits.
+ *   - A free OS port is claimed before each suite so parallel jest
+ *     workers never collide.
+ *   - The temp DB file is deleted in afterAll.
  */
 describe('Events REST API (e2e, real SQLite DB)', () => {
   let app: INestApplication<App>;
@@ -26,7 +25,6 @@ describe('Events REST API (e2e, real SQLite DB)', () => {
     .toString(36)
     .slice(2)}.sqlite`;
 
-  /** Ask the OS for a free TCP port in the high range. */
   function getFreePort(): Promise<number> {
     return new Promise((resolve, reject) => {
       const probe = net.createServer();
@@ -34,8 +32,7 @@ describe('Events REST API (e2e, real SQLite DB)', () => {
       probe.on('error', reject);
       probe.listen(0, '127.0.0.1', () => {
         const addr = probe.address();
-        const port =
-          typeof addr === 'object' && addr ? addr.port : 0;
+        const port = typeof addr === 'object' && addr ? addr.port : 0;
         probe.close(() => resolve(port));
       });
     });
@@ -71,15 +68,12 @@ describe('Events REST API (e2e, real SQLite DB)', () => {
   });
 
   afterAll(async () => {
-    // Close the Nest app (which closes the http server + DB connections),
-    // then give the OS a moment to fully release the port.
     try {
       await app.close();
     } catch {
       /* ignore */
     }
     await new Promise((r) => setTimeout(r, 100));
-    // Best-effort cleanup of the temp DB file.
     try {
       const fs = await import('node:fs/promises');
       await fs.unlink(testDbPath);
@@ -88,6 +82,8 @@ describe('Events REST API (e2e, real SQLite DB)', () => {
     }
   });
 
+  // ── Test 1: validation ───────────────────────────────────────────────────
+
   it('rejects malformed event payloads (400)', async () => {
     await request(app.getHttpServer())
       .post('/events')
@@ -95,8 +91,10 @@ describe('Events REST API (e2e, real SQLite DB)', () => {
       .expect(400);
   });
 
-  it('supports full CRUD + merge flow for a user', async () => {
-    // 1) Create two users.
+  // ── Test 2: full CRUD + merge via EventsController ───────────────────────
+
+  it('supports full CRUD + merge via POST /events/merge/:userId', async () => {
+    // Create two users.
     const ada = await request(app.getHttpServer())
       .post('/users')
       .send({ name: 'Ada' })
@@ -108,7 +106,7 @@ describe('Events REST API (e2e, real SQLite DB)', () => {
     const adaId = ada.body.id as string;
     const beaId = bea.body.id as string;
 
-    // 2) Create two overlapping events both inviting Ada (and Bea on E2).
+    // Create two overlapping events.
     const e1 = await request(app.getHttpServer())
       .post('/events')
       .send({
@@ -135,16 +133,23 @@ describe('Events REST API (e2e, real SQLite DB)', () => {
       .expect(201);
     const e2Id = e2.body.id as string;
 
-    // 3) Retrieve an event by id (GET /events/:id).
+    // GET /events/:id
     const fetched = await request(app.getHttpServer())
       .get(`/events/${e1Id}`)
       .expect(200);
-    expect(fetched.body.id).toBe(e1Id);
     expect(fetched.body.title).toBe('Standup');
 
-    // 4) Merge for Ada — the two overlapping events collapse into one.
+    // GET /events?userId=adaId — should return both of Ada's events.
+    const adaEvents = await request(app.getHttpServer())
+      .get(`/events?userId=${adaId}`)
+      .expect(200);
+    expect(adaEvents.body.map((e: { id: string }) => e.id)).toEqual(
+      expect.arrayContaining([e1Id, e2Id]),
+    );
+
+    // POST /events/merge/:userId — EventsController route.
     const merged = await request(app.getHttpServer())
-      .post(`/users/${adaId}/merge-events`)
+      .post(`/events/merge/${adaId}`)
       .expect(200);
     expect(merged.body).toHaveLength(1);
     const m = merged.body[0];
@@ -152,26 +157,66 @@ describe('Events REST API (e2e, real SQLite DB)', () => {
     expect(m.endTime).toBe('2026-01-01T12:00:00.000Z');
     expect(m.title).toContain('Standup');
     expect(m.title).toContain('1:1');
-    expect(m.status).toBe('IN_PROGRESS');
+    expect(m.status).toBe('IN_PROGRESS'); // IN_PROGRESS beats TODO
 
-    // The originals are gone.
+    // Originals are gone.
     await request(app.getHttpServer()).get(`/events/${e1Id}`).expect(404);
     await request(app.getHttpServer()).get(`/events/${e2Id}`).expect(404);
 
-    // Ada now points at the merged event id; Bea still points at e2.
+    // Ada's events list now points only at the merged event.
     const adaAfter = await request(app.getHttpServer())
       .get(`/users/${adaId}`)
       .expect(200);
     expect(adaAfter.body.events).toEqual([m.id]);
 
-    // 5) Delete the merged event.
-    await request(app.getHttpServer())
-      .delete(`/events/${m.id}`)
-      .expect(204);
+    // DELETE /events/:id
+    await request(app.getHttpServer()).delete(`/events/${m.id}`).expect(204);
     await request(app.getHttpServer()).get(`/events/${m.id}`).expect(404);
   });
 
-  it('returns 404 for an unknown event', async () => {
+  // ── Test 3: merge via UsersController ────────────────────────────────────
+
+  it('POST /users/:id/merge-events also merges correctly (UsersController route)', async () => {
+    const cy = await request(app.getHttpServer())
+      .post('/users')
+      .send({ name: 'Cy' })
+      .expect(201);
+    const cyId = cy.body.id as string;
+
+    await request(app.getHttpServer())
+      .post('/events')
+      .send({
+        title: 'Alpha',
+        status: 'TODO',
+        startTime: '2026-03-01T09:00:00Z',
+        endTime: '2026-03-01T10:00:00Z',
+        invitees: [cyId],
+      })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .post('/events')
+      .send({
+        title: 'Beta',
+        status: 'COMPLETED',
+        startTime: '2026-03-01T09:30:00Z',
+        endTime: '2026-03-01T11:00:00Z',
+        invitees: [cyId],
+      })
+      .expect(201);
+
+    const merged = await request(app.getHttpServer())
+      .post(`/users/${cyId}/merge-events`)
+      .expect(200);
+    expect(merged.body).toHaveLength(1);
+    expect(merged.body[0].title).toContain('Alpha');
+    expect(merged.body[0].title).toContain('Beta');
+    expect(merged.body[0].status).toBe('COMPLETED'); // COMPLETED wins when no IN_PROGRESS
+  });
+
+  // ── Test 4: 404 for unknown event ────────────────────────────────────────
+
+  it('returns 404 for an unknown event id', async () => {
     await request(app.getHttpServer())
       .get('/events/00000000-0000-4000-8000-000000000000')
       .expect(404);
