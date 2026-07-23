@@ -398,3 +398,12 @@ Temporary Items
 dist
 .webpack
 .serverless/**/*.zip
+
+# Local SQLite databases (runtime + e2e)
+data.sqlite
+data.sqlite-journal
+test/e2e-*.sqlite
+test/e2e-*.sqlite-journal
+
+# Personal assignment brief (not part of the source)
+NestJS Feature Enhancement Assignment.md
